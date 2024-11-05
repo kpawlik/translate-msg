@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -62,22 +64,222 @@ var (
 		InDir:  `E:\repos\IQGeo_IS_v7.0.5.2\mywapp_common\public\locales\en`,
 		OutDir: `E:\repos\IQGeo_IS_v7.0.5.2\mywapp_common\public\locales\nl`,
 		Files: []string{
-			// `mywapp_common.msg`,
+			`mywapp_common.msg`,
 		},
 		Lang: "nl",
 	}
-	modules = []Files{core, survey, common}
-	// modules = []Files{coreTest}
+	anywhere = Files{
+		InDir: `E:\Projects\Stedin\Anywhere-message-files\anywhere\en`,
+		OutDir: `E:\Projects\Stedin\Anywhere-message-files\anywhere\nl`,
+		Files: []string{
+			`myw.app.msg`,
+		},
+		Lang: "nl",
+	}
+	missing = Files{
+		InDir: `C:\kpa-home\GoogleDrive\dev\GO\translate-msg\translations\en`,
+		OutDir: `C:\kpa-home\GoogleDrive\dev\GO\translate-msg\translations\nl`,
+		Files: []string{
+			`missing.msg`,
+		},
+		Lang: "nl",
+	}
+	// modules = []Files{core, survey, common}
+	modules = []Files{missing}
 )
+
+
+type OrderedMap struct{
+	Map map[string]interface{}
+	Keys []string
+}
+
+// Create a new OrderedMap
+func NewOrderedMap() *OrderedMap {
+	return &OrderedMap{
+		Map:    make(map[string]interface{}),
+		Keys: []string{},
+	}
+}
+
+func (om *OrderedMap) ParseObject(dec *json.Decoder) (err error) {
+	var t json.Token
+	var value interface{}
+	for dec.More() {
+		t, err = dec.Token()
+		if err != nil {
+			return err
+		}
+
+		key, ok := t.(string)
+		if !ok {
+			return fmt.Errorf("expecting JSON key should be always a string: %T: %v", t, t)
+		}
+
+		t, err = dec.Token()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+
+		value, err = HandleDelim(t, dec)
+		if err != nil {
+			return err
+		}
+		om.Map[key] = value
+		om.Keys = append(om.Keys, key)
+	}
+		t, err = dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != '}' {
+		return fmt.Errorf("expect JSON object close with '}'")
+	}
+
+	return nil
+}
+
+
+// this implements type json.Unmarshaler interface, so can be called in json.Unmarshal(data, om)
+func (om *OrderedMap) UnmarshalJSON(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+
+	// must open with a delim token '{'
+	t, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("expect JSON object open with '{'")
+	}
+
+	err = om.ParseObject(dec)
+	if err != nil {
+		return err
+	}
+
+	t, err = dec.Token()
+	if err != io.EOF {
+		return fmt.Errorf("expect end of JSON object but got more token: %T: %v or err: %v", t, t, err)
+	}
+
+	return nil
+}
+
+
+// this implements type json.Marshaler interface, so can be called in json.Marshal(om)
+func (om *OrderedMap) MarshalJSON() (res []byte, err error) {
+	lines := make([]string, len(om.Keys))
+	for i, key := range om.Keys {
+		var b []byte
+		b, err = json.Marshal(om.Map[key])
+		if err != nil {
+			return
+		}
+		lines[i] = fmt.Sprintf("\"%s\": %s", key, string(b))
+	}
+	res = append(res, '{')
+	res = append(res, []byte(strings.Join(lines, ","))...)
+	res = append(res, '}')
+	return
+}
+
+func ParseArray(dec *json.Decoder) (arr []interface{}, err error) {
+	var t json.Token
+	arr = make([]interface{}, 0)
+	for dec.More() {
+		t, err = dec.Token()
+		if err != nil {
+			return
+		}
+
+		var value interface{}
+		value, err = HandleDelim(t, dec)
+		if err != nil {
+			return
+		}
+		arr = append(arr, value)
+	}
+	t, err = dec.Token()
+	if err != nil {
+		return
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != ']' {
+		err = fmt.Errorf("expect JSON array close with ']'")
+		return
+	}
+
+	return
+}
+
+
+
+
+func HandleDelim(t json.Token, dec *json.Decoder) (res interface{}, err error) {
+	if delim, ok := t.(json.Delim); ok {
+		switch delim {
+		case '{':
+			om2 := NewOrderedMap()
+			err = om2.ParseObject(dec)
+			if err != nil {
+				return
+			}
+			return om2, nil
+		case '[':
+			var value []interface{}
+			value, err = ParseArray(dec)
+			if err != nil {
+				return
+			}
+			return value, nil
+		default:
+			return nil, fmt.Errorf("unexpected delimiter: %q", delim)
+		}
+	}
+	return t, nil
+}
+
+
+
+
+func processJson(source *OrderedMap, lang string, client *translate.Client) (target *OrderedMap, err error) {
+	target = NewOrderedMap()
+	for _, namespace := range source.Keys {
+		items := source.Map[namespace]
+		targetNs := NewOrderedMap()
+		target.Map[namespace] = targetNs
+		target.Keys = append(target.Keys, namespace)
+		itemsMap, _ := items.(*OrderedMap)
+		for _, key := range itemsMap.Keys {
+			targetNs.Keys = append(targetNs.Keys, key)
+			text := itemsMap.Map[key]
+			if LIMIT > 0 && cnt > LIMIT {
+				break
+			}
+			switch val := text.(type) {
+			case []any:
+				targetNs.Map[key] = translateArray(val, lang, client)
+			case string:
+				translated := translateStr(val, lang, client)
+				targetNs.Map[key] = translated
+			}
+		}
+	}
+	return
+}
 
 
 func main() {
 	var (
 		bytes  []byte
 		err    error
-		source map[string]map[string]interface{}
-		target map[string]map[string]interface{}
 		client *translate.Client
+		target *OrderedMap
+		
+	
 	)
 	ctx := context.Background()
 	client, err = translate.NewClient(ctx)
@@ -85,6 +287,7 @@ func main() {
 		log.Fatalf("Connect to translate client error, %v", err)
 	}
 	defer client.Close()
+	source := NewOrderedMap()
 	for _, module := range modules {
 		log.Printf("Processing module %s\n", module.InDir)
 		for _, file := range module.Files {
@@ -117,96 +320,6 @@ func main() {
 
 
 
-func processJson(source map[string]map[string]interface{}, lang string, client *translate.Client) (target map[string]map[string]interface{}, err error) {
-	target = make(map[string]map[string]interface{})
-	for namespace, items := range source {
-		target[namespace] = make(map[string]interface{})
-		for key, text := range items {
-			if LIMIT > 0 && cnt > LIMIT {
-				break
-			}
-			switch val := text.(type) {
-			case []any:
-				target[namespace][key] = translateArray(val, lang, client)
-			case string:
-				translated := translateStr(val, lang, client)
-				target[namespace][key] = translated
-			}
-		}
-	}
-	return
-}
-
-// func test() {
-// 	const IN_FILE = `tst-en.msg`
-// 	const OUT_FILE = `tst-nl.msg`
-
-// 	var (
-// 		bytes []byte
-// 		err   error
-// 	)
-// 	bytes, err = os.ReadFile(IN_FILE)
-// 	if err != nil {
-// 		log.Fatal(err)
-// 	}
-// 	var source map[string]map[string]interface{}
-// 	target := make(map[string]map[string]interface{})
-
-// 	json.Unmarshal(bytes, &source)
-// 	cnt := 0
-// 	for namespace, items := range source {
-// 		_ = namespace
-// 		target[namespace] = make(map[string]interface{})
-// 		for key, text := range items {
-// 			if LIMIT > 0 && cnt > LIMIT {
-// 				break
-// 			}
-// 			switch val := text.(type) {
-// 			case []any:
-// 				target[namespace][key] = translateArray(val, "nl")
-// 			case string:
-// 				// translated := translateStr(t)
-// 				translated := mockTranslateStrFromFile(key, val)
-// 				translated = replacePlaceholders(val, translated)
-// 				target[namespace][key] = translated
-// 			}
-// 			cnt++
-// 		}
-
-// 	}
-// 	// bytes, err = json.Marshal(target)
-// 	// if err != nil{
-// 	// 	log.Fatal(err)
-// 	// }
-// 	//os.WriteFile(OUT_FILE, bytes, os.ModePerm)
-// 	print(target)
-
-// }
-
-// func mockTranslateStrFromFile(key, text string) string {
-// 	cnt++
-// 	var (
-// 		bytes []byte
-// 		err   error
-// 	)
-// 	bytes, err = os.ReadFile(OUT_FILE)
-// 	if err != nil {
-// 		log.Fatal(err)
-// 	}
-// 	var source map[string]map[string]interface{}
-
-// 	if err = json.Unmarshal(bytes, &source); err != nil {
-// 		log.Fatal(err)
-// 	}
-// 	for _, v := range source {
-// 		for kk, vv := range v {
-// 			if kk == key {
-// 				return vv.(string)
-// 			}
-// 		}
-// 	}
-// 	return ""
-// }
 
 func mockTranslateStr(t string) string {
 	return t
@@ -217,19 +330,14 @@ func translateStr(original string, lang string, client *translate.Client) string
 	if DEBUG{
 		return mockTranslateStr(original)
 	}
-	// fmt.Println(1, original)
 	translated, err := translateText(lang, original, client)
 	if err != nil {
 		log.Fatal(err)
 	}
-	// fmt.Println(2, translated)
 	translated = replacePlaceholders(original, translated)
-	// fmt.Println(3, translated)
 	translated = html.UnescapeString(translated)
-	// fmt.Println(4, translated)
 	translated = html.EscapeString(translated)
 	translated = strings.ReplaceAll(translated, "&#39;", "'")
-	// fmt.Println(5, translated)
 	return translated
 }
 
@@ -243,23 +351,12 @@ func translateArray(arr []any, lang string, client *translate.Client) []string {
 	return results
 }
 
-// func print(obj map[string]map[string]interface{}) {
-// 	for k, v := range obj {
-// 		fmt.Println(k)
-// 		for kk, vv := range v {
-// 			fmt.Printf("   %s: %v\n", kk, vv)
-// 		}
-// 	}
-// }
 
 func translateText(targetLanguage, text string, client *translate.Client) (string, error) {
-	
-
 	lang, err := language.Parse(targetLanguage)
 	if err != nil {
 		return "", fmt.Errorf("language.Parse: %w", err)
 	}
-
 	resp, err := client.Translate(context.Background(), []string{text}, lang, nil)
 	if err != nil {
 		return "", fmt.Errorf("translate: %w", err)
@@ -274,9 +371,6 @@ func replacePlaceholders(original, translated string) string {
 	var (
 		result string
 	)
-	// fmt.Println("---")
-	// fmt.Println(original)
-	// fmt.Println(translated)
 	result = translated
 	re := regexp.MustCompile(`(__\w+__)`)
 	oPh := re.FindAllString(original, -1)
@@ -286,6 +380,5 @@ func replacePlaceholders(original, translated string) string {
 			result = strings.Replace(result, tPh[i], oPh[i], 1)
 		}
 	}
-	// fmt.Println(result)
 	return result
 }
